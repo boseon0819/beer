@@ -1,0 +1,503 @@
+# =========================================================
+# Taste-wise Greedy Forward Selection (CV-based, no test-leak)  [RESUMABLE]
+# - Outer: 7:3 stratified Train/Test (stratify=y_class 유지)
+# - Inner: KFold (비층화, 카테고리 미사용)  ✅ 요청 반영
+# - 체크포인트 저장/재개 + (옵션) k-step 단위 저장
+# =========================================================
+
+# =========================================================
+# 0) Imports
+# =========================================================
+import os
+import sys
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import train_test_split, KFold          # ★ StratifiedKFold -> KFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.neural_network import MLPRegressor
+from sklearn.metrics import r2_score
+from sklearn.impute import SimpleImputer
+
+warnings.simplefilter(action="ignore", category=FutureWarning)
+
+# =========================================================
+# 1) PREP: Build X, Y, y_class (if missing)
+# =========================================================
+target_path = "/home/a202152010/flavor"
+excel_filename = "Supplemental Files and Figure source files.xlsx"
+
+try:
+    os.chdir(target_path)
+    print(f"작업 경로 변경: {os.getcwd()}")
+except FileNotFoundError:
+    print(f"[WARN] 경로를 찾을 수 없습니다: {target_path}")
+
+try:
+    from init_modeling import generate_X
+    print("[OK] imported generate_X from init_modeling.py")
+except ModuleNotFoundError:
+    print("[WARN] init_modeling 모듈을 찾지 못했습니다. fallback generate_X를 사용합니다.")
+
+    def generate_X(df: pd.DataFrame, impute: bool = True):
+        X_df = df.copy()
+        if "beer_id" in X_df.columns:
+            X_df = X_df.drop(columns=["beer_id"])
+        X_df = X_df.apply(pd.to_numeric, errors="coerce")
+        if impute:
+            imp = SimpleImputer(strategy="median")
+            X_np = imp.fit_transform(X_df.values)
+        else:
+            X_np = X_df.values
+        return X_np.astype(np.float32)
+
+if not all([v in globals() for v in ["X", "Y", "y_class"]]):
+    chem_dataset = pd.read_excel(excel_filename, sheet_name="Supplementary File S1").set_index("beer")
+    trained_panel_dataset = pd.read_excel(excel_filename, sheet_name="Supplementary File S4").set_index("beer")
+    chem_dataset_expertpanel = chem_dataset.join(trained_panel_dataset, lsuffix="_chem", rsuffix="_panel")
+
+    beer_id_col = chem_dataset_expertpanel["beer_id_chem"].rename("beer_id")
+    target_features = chem_dataset_expertpanel.loc[:, "acetaldehyde":"sulfur_sum"]
+
+    X_input = pd.concat([beer_id_col, target_features], axis=1)
+    X = generate_X(X_input, impute=True)  # (N,231)
+
+    Y = chem_dataset_expertpanel.loc[:, "A_malt_all":"overall"]  # (N,50)
+    y_class = chem_dataset_expertpanel.loc[:, "tasting_category_fine_chem"]  # (N,)
+
+    feature_names = list(target_features.columns)
+    target_names  = list(Y.columns)
+
+    print("[PREP] built X, Y, y_class")
+    print("X shape:", np.array(X).shape)
+    print("Y shape:", Y.shape)
+else:
+    print("[PREP] X, Y, y_class already exist -> skip build")
+
+# =========================================================
+# 2) Config
+# =========================================================
+OUT_DIR  = "Model_performance"
+PLOT_DIR = os.path.join(OUT_DIR, "taste_plots")
+CKPT_DIR = os.path.join(OUT_DIR, "_checkpoint")
+os.makedirs(OUT_DIR, exist_ok=True)
+os.makedirs(PLOT_DIR, exist_ok=True)
+os.makedirs(CKPT_DIR, exist_ok=True)
+
+# ---- Resumable options ----
+RESUME_IF_EXISTS         = True
+SAVE_PER_K_STEP          = True
+SAVE_EVERY_K             = 1
+
+# ---- Outer split ----
+OUTER_TEST_SIZE = 0.30
+OUTER_SEED      = 0
+
+# ---- Inner CV (KFold: 비층화) ----
+INNER_SEED      = 42
+INNER_N_SPLITS  = 5          # ★ 자유롭게 선택 가능(3~5 권장)             # *
+
+# ---- Greedy ----
+K_MAX           = 231
+PATIENCE        = 8
+MIN_IMPROVE     = 1e-4
+
+# ---- Overfit control ----
+USE_GAP_PENALTY = True
+LAMBDA_GAP      = 0.8
+
+# ---- MLP ----
+ALPHAS          = [1e-3, 1e-2, 1e-1]
+HIDDEN          = (64, 64)
+MAX_ITER        = 2000
+
+# =========================================================
+# 3) Names
+# =========================================================
+X_np = np.asarray(X)
+Y_df = Y if isinstance(Y, pd.DataFrame) else pd.DataFrame(Y)
+y_cls = pd.Series(y_class).reset_index(drop=True).values  # ★ Outer stratify에만 사용
+
+N, n_features = X_np.shape
+n_targets = Y_df.shape[1]
+
+if "feature_names" in globals() and isinstance(feature_names, (list, tuple)) and len(feature_names) == n_features:
+    feat_list = list(feature_names)
+else:
+    feat_list = [f"chem_{i:03d}" for i in range(n_features)]
+
+if "target_names" in globals() and isinstance(target_names, (list, tuple)) and len(target_names) == n_targets:
+    taste_list = list(target_names)
+else:
+    taste_list = list(Y_df.columns)
+
+# =========================================================
+# 4) Outer split + scaling  (여기만 stratify 유지)
+# =========================================================
+try:
+    X_tr_raw, X_te_raw, Y_tr_raw, Y_te_raw, y_tr_cls, y_te_cls = train_test_split(
+        X_np, Y_df.values, y_cls,
+        test_size=OUTER_TEST_SIZE,
+        random_state=OUTER_SEED,
+        shuffle=True,
+        stratify=y_cls
+    )
+except ValueError:
+    print("[WARN] Outer stratified split failed -> random split used.")
+    X_tr_raw, X_te_raw, Y_tr_raw, Y_te_raw, y_tr_cls, y_te_cls = train_test_split(
+        X_np, Y_df.values, y_cls,
+        test_size=OUTER_TEST_SIZE,
+        random_state=OUTER_SEED,
+        shuffle=True
+    )
+
+sx = StandardScaler().fit(X_tr_raw)
+sy = StandardScaler().fit(Y_tr_raw)
+
+X_tr = sx.transform(X_tr_raw).astype(np.float32)
+X_te = sx.transform(X_te_raw).astype(np.float32)
+Y_tr = sy.transform(Y_tr_raw).astype(np.float32)
+Y_te = sy.transform(Y_te_raw).astype(np.float32)
+
+print(f"[Outer] Train={X_tr.shape[0]}, Test={X_te.shape[0]} | X={X_tr.shape[1]}, Y={Y_tr.shape[1]}")
+print("[Inner CV] Using KFold (NON-stratified) -> n_splits =", INNER_N_SPLITS)
+
+# ★ Inner CV splitter: KFold (yc ls 사용 안 함)
+kf = KFold(n_splits=INNER_N_SPLITS, shuffle=True, random_state=INNER_SEED)
+
+# =========================================================
+# 5) Utilities
+# =========================================================
+def safe_r2(y_true, y_pred):
+    if not np.isfinite(y_pred).all():
+        return np.nan
+    if np.std(y_true) < 1e-8:
+        return np.nan
+    return r2_score(y_true, y_pred)
+
+def make_mlp(alpha, seed):
+    return MLPRegressor(
+        hidden_layer_sizes=HIDDEN,
+        activation="relu",
+        solver="adam",
+        alpha=alpha,
+        learning_rate_init=1e-3,
+        max_iter=MAX_ITER,
+        early_stopping=True,
+        validation_fraction=0.15,
+        n_iter_no_change=20,
+        tol=1e-5,
+        random_state=seed,
+        verbose=False
+    )
+
+# ★ ycls 인자 제거: KFold는 y 필요 없음
+def cv_eval_cols(X, y, cols, base_seed):
+    best = (-np.inf, np.inf, None)  # mean, se, alpha
+    for alpha in ALPHAS:
+        r2_list = []
+        for fold_i, (tr_i, va_i) in enumerate(kf.split(X)):
+            seed = int(base_seed + 1000 * fold_i)  # cand 무관 고정
+            model = make_mlp(alpha=alpha, seed=seed)
+            model.fit(X[tr_i][:, cols], y[tr_i])
+            pred = model.predict(X[va_i][:, cols])
+            r2v = safe_r2(y[va_i], pred)
+            if np.isnan(r2v):
+                r2v = -np.inf
+            r2_list.append(r2v)
+
+        r2_arr  = np.array(r2_list, dtype=float)
+        mean_r2 = float(np.mean(r2_arr))
+        se_r2   = float(np.std(r2_arr, ddof=1) / np.sqrt(len(r2_arr))) if len(r2_arr) > 1 else 0.0
+
+        if mean_r2 > best[0]:
+            best = (mean_r2, se_r2, alpha)
+    return best
+
+def refit_train_test_r2(Xtr, ytr, Xte, yte, cols, alpha, seed):
+    model = make_mlp(alpha=alpha, seed=seed)
+    model.fit(Xtr[:, cols], ytr)
+    pred_tr = model.predict(Xtr[:, cols])
+    pred_te = model.predict(Xte[:, cols])
+    return safe_r2(ytr, pred_tr), safe_r2(yte, pred_te)
+
+def score_with_gap(val_mean, train_r2):
+    if not USE_GAP_PENALTY:
+        return float(val_mean)
+    if (not np.isfinite(val_mean)) or (not np.isfinite(train_r2)):
+        return float(val_mean)
+    gap = float(train_r2 - val_mean)
+    return float(val_mean - LAMBDA_GAP * max(0.0, gap))
+
+# =========================================================
+# 6) Checkpoint I/O helpers
+# =========================================================
+def _taste_safe_name(taste: str) -> str:
+    return taste.replace("/", "_").replace("\\", "_").replace(":", "_")
+
+def ckpt_paths(taste: str):
+    t = _taste_safe_name(taste)
+    return {
+        "summary": os.path.join(CKPT_DIR, f"summary__{t}.csv"),
+        "progress": os.path.join(CKPT_DIR, f"progress__{t}.csv"),
+        "doneflag": os.path.join(CKPT_DIR, f"DONE__{t}.flag"),
+    }
+
+def is_done(taste: str) -> bool:
+    return os.path.exists(ckpt_paths(taste)["doneflag"])
+
+def save_ckpt(taste: str, summary_row: dict, prog_df: pd.DataFrame, done: bool):
+    p = ckpt_paths(taste)
+    pd.DataFrame([summary_row]).to_csv(p["summary"], index=False, encoding="utf-8-sig")
+    prog_df.to_csv(p["progress"], index=False, encoding="utf-8-sig")
+    if done:
+        with open(p["doneflag"], "w", encoding="utf-8") as f:
+            f.write("done")
+
+def load_ckpt(taste: str):
+    p = ckpt_paths(taste)
+    if not os.path.exists(p["summary"]) or not os.path.exists(p["progress"]):
+        return None, None, False
+    summ = pd.read_csv(p["summary"])
+    prog = pd.read_csv(p["progress"])
+    done = os.path.exists(p["doneflag"])
+    return summ, prog, done
+
+# =========================================================
+# 7) Per-taste greedy forward (with periodic checkpoint)
+# =========================================================
+def run_one_taste(taste_idx: int):
+    taste = taste_list[taste_idx]
+    ytr = Y_tr[:, taste_idx].astype(np.float32)
+    yte = Y_te[:, taste_idx].astype(np.float32)
+    taste_seed = 10000 + taste_idx * 100
+
+    # ------------------------------
+    # (A) k=1 univariate best by CV
+    # ------------------------------
+    best_start = None
+    best_pack = None
+
+    for fi in range(n_features):
+        val_mean, val_se, alpha = cv_eval_cols(X_tr, ytr, [fi], base_seed=taste_seed + 10)
+        tr_r2, te_r2 = refit_train_test_r2(X_tr, ytr, X_te, yte, [fi], alpha=alpha, seed=taste_seed + 999)
+        sc = score_with_gap(val_mean, tr_r2)
+
+        if best_start is None or sc > best_pack[-1]:
+            best_start = fi
+            best_pack = (val_mean, val_se, alpha, tr_r2, te_r2, sc)
+
+    selected = [int(best_start)]
+    steps = []
+
+    def push_step(k, added_idx, val_mean, val_se, alpha, tr_r2, te_r2, sc):
+        prev = steps[-1] if len(steps) else None
+        d_test = (te_r2 - prev["test_r2"]) if (prev is not None and np.isfinite(te_r2) and np.isfinite(prev["test_r2"])) else np.nan
+        d_val  = (val_mean - prev["val_r2"]) if (prev is not None and np.isfinite(val_mean) and np.isfinite(prev["val_r2"])) else np.nan
+
+        steps.append({
+            "taste": taste,
+            "k": int(k),
+            "added_feature": feat_list[int(added_idx)],
+            "added_feat_idx": int(added_idx),
+
+            "train_r2": float(tr_r2) if np.isfinite(tr_r2) else np.nan,
+            "val_r2":   float(val_mean) if np.isfinite(val_mean) else np.nan,
+            "val_se":   float(val_se) if np.isfinite(val_se) else np.nan,
+            "test_r2":  float(te_r2) if np.isfinite(te_r2) else np.nan,
+
+            "gap_train_minus_val": float(tr_r2 - val_mean) if (np.isfinite(tr_r2) and np.isfinite(val_mean)) else np.nan,
+            "score": float(sc) if np.isfinite(sc) else np.nan,
+            "alpha": float(alpha),
+
+            "delta_val": float(d_val) if np.isfinite(d_val) else np.nan,
+            "delta_test": float(d_test) if np.isfinite(d_test) else np.nan,
+
+            "selected_features_so_far": ", ".join([feat_list[i] for i in selected]),
+        })
+
+    # k=1
+    val_mean, val_se, alpha, tr_r2, te_r2, sc = best_pack
+    push_step(1, best_start, val_mean, val_se, alpha, tr_r2, te_r2, sc)
+
+    best_score = steps[-1]["score"]
+    best_val_mean = steps[-1]["val_r2"]
+    best_val_se   = steps[-1]["val_se"]
+    best_k_by_score = 1
+    no_improve = 0
+
+    def build_partial_summary(stop_k, final_k_1se):
+        last = steps[-1]
+        return {
+            "taste": taste,
+            "stop_k": int(stop_k),
+            "best_k_by_score": int(best_k_by_score),
+            "final_k_1se": int(final_k_1se),
+
+            "final_train_r2": float(last["train_r2"]),
+            "final_val_r2": float(last["val_r2"]),
+            "final_test_r2": float(last["test_r2"]),
+            "final_gap": float(last["gap_train_minus_val"]) if np.isfinite(last["gap_train_minus_val"]) else np.nan,
+            "final_features": last["selected_features_so_far"],
+
+            "full231_train_r2": np.nan,
+            "full231_val_r2": np.nan,
+            "full231_test_r2": np.nan,
+        }
+
+    # k=2..K_MAX
+    for k in range(2, min(K_MAX, n_features) + 1):
+        remaining = [i for i in range(n_features) if i not in selected]
+
+        best_cand = None
+        best_pack = None
+
+        for cand in remaining:
+            cols = selected + [cand]
+            val_mean, val_se, alpha = cv_eval_cols(X_tr, ytr, cols, base_seed=taste_seed + 1000 * k)
+            tr_r2, te_r2 = refit_train_test_r2(X_tr, ytr, X_te, yte, cols, alpha=alpha, seed=taste_seed + 999 + k)
+            sc = score_with_gap(val_mean, tr_r2)
+
+            if best_cand is None or sc > best_pack[-1]:
+                best_cand = cand
+                best_pack = (val_mean, val_se, alpha, tr_r2, te_r2, sc)
+
+        selected.append(int(best_cand))
+        val_mean, val_se, alpha, tr_r2, te_r2, sc = best_pack
+        push_step(k, best_cand, val_mean, val_se, alpha, tr_r2, te_r2, sc)
+
+        if sc > best_score + MIN_IMPROVE:
+            best_score = sc
+            best_val_mean = val_mean
+            best_val_se   = val_se
+            best_k_by_score = k
+            no_improve = 0
+        else:
+            no_improve += 1
+
+        # ---- k-step 중간 저장 ----
+        if SAVE_PER_K_STEP and (k % SAVE_EVERY_K == 0):
+            prog_df = pd.DataFrame(steps)
+            thr = float(best_val_mean - best_val_se) if (np.isfinite(best_val_mean) and np.isfinite(best_val_se)) else float(best_val_mean)
+            k_1se_tmp = int(prog_df.loc[prog_df["val_r2"] >= thr, "k"].min()) if np.isfinite(thr) else best_k_by_score
+            if not np.isfinite(k_1se_tmp):
+                k_1se_tmp = best_k_by_score
+            partial_summary = build_partial_summary(stop_k=prog_df["k"].max(), final_k_1se=k_1se_tmp)
+            save_ckpt(taste, partial_summary, prog_df, done=False)
+
+        if no_improve >= PATIENCE:
+            break
+
+    prog = pd.DataFrame(steps)
+
+    # (C) 1-SE rule
+    thr = float(best_val_mean - best_val_se) if (np.isfinite(best_val_mean) and np.isfinite(best_val_se)) else float(best_val_mean)
+    k_1se = int(prog.loc[prog["val_r2"] >= thr, "k"].min()) if np.isfinite(thr) else best_k_by_score
+    if not np.isfinite(k_1se):
+        k_1se = best_k_by_score
+
+    # (D) full-231
+    all_cols = list(range(n_features))
+    full_val_mean, full_val_se, full_alpha = cv_eval_cols(X_tr, ytr, all_cols, base_seed=taste_seed + 777777)
+    full_tr_r2, full_te_r2 = refit_train_test_r2(X_tr, ytr, X_te, yte, all_cols, alpha=full_alpha, seed=taste_seed + 888888)
+
+    row_final = prog[prog["k"] == k_1se].iloc[0]
+    summary = {
+        "taste": taste,
+        "stop_k": int(prog["k"].max()),
+        "best_k_by_score": int(best_k_by_score),
+        "final_k_1se": int(k_1se),
+
+        "final_train_r2": float(row_final["train_r2"]),
+        "final_val_r2": float(row_final["val_r2"]),
+        "final_test_r2": float(row_final["test_r2"]),
+        "final_gap": float(row_final["gap_train_minus_val"]) if pd.notna(row_final["gap_train_minus_val"]) else np.nan,
+        "final_features": row_final["selected_features_so_far"],
+
+        "full231_train_r2": float(full_tr_r2) if np.isfinite(full_tr_r2) else np.nan,
+        "full231_val_r2": float(full_val_mean) if np.isfinite(full_val_mean) else np.nan,
+        "full231_test_r2": float(full_te_r2) if np.isfinite(full_te_r2) else np.nan,
+    }
+
+    save_ckpt(taste, summary, prog, done=True)
+    return summary, prog
+
+# =========================================================
+# 8) Main loop (RESUME)
+# =========================================================
+all_summ_rows = []
+all_prog_dfs  = []
+
+for ti, taste in enumerate(taste_list):
+    if RESUME_IF_EXISTS and is_done(taste):
+        summ_df, prog_df, done = load_ckpt(taste)
+        print(f"[SKIP] taste='{taste}' already done -> loaded checkpoint")
+        all_summ_rows.append(summ_df.iloc[0].to_dict())
+        all_prog_dfs.append(prog_df)
+        continue
+
+    print(f"[RUN] [{ti+1:02d}/{len(taste_list)}] taste='{taste}'")
+    summ, prog = run_one_taste(ti)
+    all_summ_rows.append(summ)
+    all_prog_dfs.append(prog)
+
+summary_df = pd.DataFrame(all_summ_rows)
+progress_long = pd.concat(all_prog_dfs, ignore_index=True)
+
+# =========================================================
+# 9) Plot per taste
+# =========================================================
+def plot_taste_progress(taste_name: str):
+    df = progress_long[progress_long["taste"] == taste_name].sort_values("k")
+    if len(df) == 0:
+        return
+
+    summ = summary_df[summary_df["taste"] == taste_name].iloc[0]
+    stop_k = int(summ["stop_k"])
+    k1se   = int(summ["final_k_1se"])
+    kbest  = int(summ["best_k_by_score"])
+
+    x = df["k"].values
+    y_val  = df["val_r2"].values
+    y_test = df["test_r2"].values
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(x, y_val,  label="val R2 (KFold mean)")
+    plt.plot(x, y_test, label="test R2 (refit, log only)")
+
+    plt.axvline(stop_k, linestyle="--", linewidth=1.2, label=f"stop_k={stop_k}")
+    plt.axvline(kbest,  linestyle="--", linewidth=1.2, label=f"best_k={kbest}")
+    plt.axvline(k1se,   linestyle="--", linewidth=1.2, label=f"k_1se={k1se}")
+
+    plt.title(f"{taste_name}: R2 vs k (Inner=KFold, Outer=stratified)")
+    plt.xlabel("k (#features)")
+    plt.ylabel("R2")
+    plt.legend()
+    plt.tight_layout()
+
+    out_png = os.path.join(PLOT_DIR, f"{_taste_safe_name(taste_name)}.png")
+    plt.savefig(out_png, dpi=150)
+    plt.close()
+
+for taste in taste_list:
+    plot_taste_progress(taste)
+
+print(f"[OK] per-taste plots saved to: {PLOT_DIR}")
+
+# =========================================================
+# 10) Save final Excel
+# =========================================================
+out_xlsx = os.path.join(OUT_DIR, "tastewise_forward_selection__OuterStrat_InnerKFold__RESUMABLE.xlsx")
+with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
+    summary_df.to_excel(writer, sheet_name="summary", index=False)
+    progress_long.to_excel(writer, sheet_name="progress_long", index=False)
+
+print(f"[OK] excel saved: {out_xlsx}")
+
+print("\n==================== SUMMARY (top by final_test_r2) ====================")
+print(summary_df.sort_values("final_test_r2", ascending=False)[[
+    "taste","final_k_1se","final_val_r2","final_train_r2","final_test_r2",
+    "full231_val_r2","full231_test_r2"
+]].to_string(index=False))
